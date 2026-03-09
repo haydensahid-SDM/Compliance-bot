@@ -1,20 +1,23 @@
 """
-Compliance Update Telegram Bot
-================================
-This bot does two things:
-1. Monitors a compliance group chat and indexes all client update messages
-2. Lets executives query the latest update for any client via /update [Client Name]
+Compliance Update Bot — Telethon Version
+=========================================
+Uses a Telegram USER account (via Telethon) to:
+1. Read full chat history on startup and index all past client updates
+2. Listen for new messages and index them in real time
+3. Respond to /update [Client Name] commands from executives
 
-Setup Instructions:
--------------------
-1. Create a bot via @BotFather on Telegram → get your BOT_TOKEN
-2. Add the bot to your compliance group chat (and give it admin/read access)
-3. Set COMPLIANCE_CHAT_ID to your compliance group's chat ID
-   (Send a message in the group, then visit:
-    https://api.telegram.org/bot<BOT_TOKEN>/getUpdates to find the chat ID)
-4. Install dependencies:  pip install python-telegram-bot==20.7 aiosqlite
-5. Set environment variables or edit the CONFIG section below
-6. Run:  python compliance_bot.py
+Extra setup vs the bot version:
+- Requires API_ID and API_HASH from https://my.telegram.org
+- Runs as a user account, not a bot account
+- On first run, will ask for your phone number + verification code (one time only)
+
+Environment Variables Required:
+- API_ID         → from https://my.telegram.org (a number like 12345678)
+- API_HASH       → from https://my.telegram.org (a string like abc123def456...)
+- BOT_TOKEN      → from @BotFather (for the bot that responds to execs)
+- COMPLIANCE_CHAT_ID → the group chat ID (negative number)
+- EXEC_CHAT_IDS  → comma-separated Telegram user IDs of execs allowed to query
+                   (optional — if empty, anyone who messages the bot can query)
 """
 
 import os
@@ -23,27 +26,29 @@ import logging
 import asyncio
 import sqlite3
 from datetime import datetime
+
+from telethon import TelegramClient, events
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    filters,
 )
 
 # ─────────────────────────────────────────────
-#  CONFIG  ← Edit these or set as env vars
+#  CONFIG
 # ─────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-
-# The numeric ID of your compliance group chat (negative number, e.g. -1001234567890)
+API_ID             = int(os.getenv("API_ID", "0"))
+API_HASH           = os.getenv("API_HASH", "")
+BOT_TOKEN          = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 COMPLIANCE_CHAT_ID = int(os.getenv("COMPLIANCE_CHAT_ID", "0"))
+SESSION_NAME       = "compliance_session"
+DB_PATH            = "compliance_updates.db"
+HISTORY_LIMIT      = 500
 
-# SQLite DB path (stores all parsed client updates)
-DB_PATH = "compliance_updates.db"
+EXEC_IDS_RAW     = os.getenv("EXEC_CHAT_IDS", "")
+ALLOWED_EXEC_IDS = set(int(x.strip()) for x in EXEC_IDS_RAW.split(",") if x.strip())
 
-# ─────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -56,39 +61,32 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════
 
 def init_db():
-    """Create the SQLite table if it doesn't exist."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS client_updates (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_name TEXT    NOT NULL,
-            raw_message TEXT    NOT NULL,
-            message_date TEXT   NOT NULL,
-            message_id  INTEGER,
-            chat_id     INTEGER,
-            created_at  TEXT    DEFAULT (datetime('now'))
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_name  TEXT    NOT NULL,
+            raw_message  TEXT    NOT NULL,
+            message_date TEXT    NOT NULL,
+            message_id   INTEGER UNIQUE,
+            created_at   TEXT    DEFAULT (datetime('now'))
         )
     """)
     conn.commit()
     conn.close()
 
 
-def save_update(client_name: str, raw_message: str, message_date: str,
-                message_id: int, chat_id: int):
+def save_update(client_name, raw_message, message_date, message_id):
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
-        INSERT INTO client_updates (client_name, raw_message, message_date, message_id, chat_id)
-        VALUES (?, ?, ?, ?, ?)
-    """, (client_name, raw_message, message_date, message_id, chat_id))
+        INSERT OR IGNORE INTO client_updates (client_name, raw_message, message_date, message_id)
+        VALUES (?, ?, ?, ?)
+    """, (client_name, raw_message, message_date, message_id))
     conn.commit()
     conn.close()
 
 
-def get_latest_update(client_name: str):
-    """
-    Fuzzy search: returns the most recent update whose client_name
-    contains the search string (case-insensitive).
-    """
+def get_latest_update(client_name):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute("""
         SELECT client_name, raw_message, message_date
@@ -99,15 +97,12 @@ def get_latest_update(client_name: str):
     """, (f"%{client_name}%",))
     row = cursor.fetchone()
     conn.close()
-    return row  # (client_name, raw_message, message_date) or None
+    return row
 
 
 def list_all_clients():
-    """Return a deduplicated list of client names in the DB."""
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.execute("""
-        SELECT DISTINCT client_name FROM client_updates ORDER BY client_name
-    """)
+    cursor = conn.execute("SELECT DISTINCT client_name FROM client_updates ORDER BY client_name")
     rows = cursor.fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -117,64 +112,62 @@ def list_all_clients():
 #  MESSAGE PARSER
 # ══════════════════════════════════════════════
 
-# Matches: "Remaining Items for <Client Name>:" at the start of a line
-CLIENT_HEADER_RE = re.compile(
-    r"Remaining Items for (.+?):",
-    re.IGNORECASE
-)
+CLIENT_HEADER_RE = re.compile(r"Remaining Items for (.+?):", re.IGNORECASE)
 
-
-def parse_client_update(text: str):
-    """
-    Returns the client name if the message looks like a compliance update,
-    otherwise returns None.
-    """
+def parse_client_update(text):
     match = CLIENT_HEADER_RE.search(text)
-    if match:
-        return match.group(1).strip()
-    return None
+    return match.group(1).strip() if match else None
 
 
 # ══════════════════════════════════════════════
-#  HANDLERS
+#  TELETHON — reads history + listens live
 # ══════════════════════════════════════════════
 
-async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Runs in the compliance group chat.
-    Detects and indexes client update messages automatically.
-    """
-    msg = update.message
-    if not msg or not msg.text:
+async def index_message(msg):
+    if not msg.text:
         return
-
-    # Only index messages from the designated compliance chat
-    if msg.chat_id != COMPLIANCE_CHAT_ID:
-        return
-
     client_name = parse_client_update(msg.text)
     if client_name:
         message_date = msg.date.strftime("%Y-%m-%d %H:%M:%S UTC")
-        save_update(
-            client_name=client_name,
-            raw_message=msg.text,
-            message_date=message_date,
-            message_id=msg.message_id,
-            chat_id=msg.chat_id,
-        )
-        logger.info(f"Indexed update for client: {client_name}")
+        save_update(client_name, msg.text, message_date, msg.id)
+        logger.info(f"Indexed: {client_name} (msg_id={msg.id})")
 
+
+async def run_telethon():
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    await client.start()
+    logger.info("Telethon connected. Loading history...")
+
+    count = 0
+    async for msg in client.iter_messages(COMPLIANCE_CHAT_ID, limit=HISTORY_LIMIT):
+        await index_message(msg)
+        count += 1
+    logger.info(f"History loaded: {count} messages scanned.")
+
+    @client.on(events.NewMessage(chats=COMPLIANCE_CHAT_ID))
+    async def on_new(event):
+        await index_message(event.message)
+
+    @client.on(events.MessageEdited(chats=COMPLIANCE_CHAT_ID))
+    async def on_edit(event):
+        await index_message(event.message)
+
+    await client.run_until_disconnected()
+
+
+# ══════════════════════════════════════════════
+#  BOT — responds to exec queries
+# ══════════════════════════════════════════════
 
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /update [Client Name]
-    Can be used in any private chat or group where the bot is present.
-    Returns the most recent compliance update for the named client.
-    """
+    user_id = update.effective_user.id
+    if ALLOWED_EXEC_IDS and user_id not in ALLOWED_EXEC_IDS:
+        await update.message.reply_text("You are not authorized to use this bot.")
+        return
+
     if not context.args:
         await update.message.reply_text(
-            "ℹ️ Usage: `/update [Client Name]`\n"
-            "Example: `/update Xit Strategy World LLC`",
+            "Usage: `/update [Client Name]`\nExample: `/update Xit Strategy World LLC`",
             parse_mode="Markdown"
         )
         return
@@ -183,45 +176,33 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = get_latest_update(query)
 
     if not row:
-        # Show available clients to help the exec
         clients = list_all_clients()
         if clients:
             client_list = "\n".join(f"• {c}" for c in clients[:20])
             await update.message.reply_text(
-                f"❌ No updates found for *{query}*.\n\n"
-                f"Known clients:\n{client_list}",
+                f"No updates found for *{query}*.\n\nKnown clients:\n{client_list}",
                 parse_mode="Markdown"
             )
         else:
-            await update.message.reply_text(
-                f"❌ No updates found for *{query}*. "
-                "The compliance chat may not have posted any updates yet.",
-                parse_mode="Markdown"
-            )
+            await update.message.reply_text(f"No updates found for *{query}*.", parse_mode="Markdown")
         return
 
     client_name, raw_message, message_date = row
-    response = (
+    await update.message.reply_text(
         f"📋 *Latest update for {client_name}*\n"
-        f"🕐 *Received:* {message_date}\n"
-        f"{'─' * 30}\n"
-        f"{raw_message}"
+        f"🕐 *Posted:* {message_date}\n"
+        f"{'─' * 30}\n{raw_message}",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(response, parse_mode="Markdown")
 
 
 async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /clients — List all clients that have updates indexed.
-    """
     clients = list_all_clients()
     if not clients:
         await update.message.reply_text("No client updates indexed yet.")
         return
-
-    client_list = "\n".join(f"• {c}" for c in clients)
     await update.message.reply_text(
-        f"📁 *Clients with updates ({len(clients)} total):*\n{client_list}",
+        f"📁 *Clients ({len(clients)} total):*\n" + "\n".join(f"• {c}" for c in clients),
         parse_mode="Markdown"
     )
 
@@ -229,49 +210,35 @@ async def cmd_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Compliance Update Bot*\n\n"
-        "*Commands:*\n"
-        "`/update [Client Name]` — Get latest update for a client\n"
-        "`/clients` — List all clients with indexed updates\n"
+        "`/update [Client Name]` — Get latest update\n"
+        "`/clients` — List all clients\n"
         "`/help` — Show this message\n\n"
-        "_Tip: Partial names work too — `/update Xit Strategy` will match "
-        "\"Xit Strategy World LLC\"_",
+        "_Partial names work: `/update Xit Strategy` matches \"Xit Strategy World LLC\"_",
         parse_mode="Markdown"
     )
+
+
+async def run_bot():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(CommandHandler("clients", cmd_clients))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_help))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot polling...")
+    await asyncio.Event().wait()
 
 
 # ══════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════
 
-def main():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("ERROR: Please set your BOT_TOKEN in the script or as an environment variable.")
-        return
-    if COMPLIANCE_CHAT_ID == 0:
-        print("ERROR: Please set your COMPLIANCE_CHAT_ID in the script or as an environment variable.")
-        return
-
+async def main():
     init_db()
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # Commands (work in any chat)
-    app.add_handler(CommandHandler("update", cmd_update))
-    app.add_handler(CommandHandler("clients", cmd_clients))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("start", cmd_help))
-
-    # Passive listener — indexes messages posted in the compliance group
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_group_message
-        )
-    )
-
-    logger.info("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await asyncio.gather(run_telethon(), run_bot())
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
